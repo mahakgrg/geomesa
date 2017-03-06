@@ -6,6 +6,7 @@ import com.vividsolutions.jts.geom.Point;
 import com.vividsolutions.jts.geom.Polygon;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
+import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterBase;
@@ -14,6 +15,7 @@ import org.geotools.factory.Hints;
 import org.geotools.filter.text.cql2.CQLException;
 import org.geotools.filter.text.ecql.ECQL;
 import org.geotools.util.Converters;
+import org.locationtech.geomesa.features.ScalaSimpleFeature;
 import org.locationtech.geomesa.features.interop.SerializationOptions;
 import org.locationtech.geomesa.features.kryo.KryoFeatureSerializer;
 import org.locationtech.geomesa.index.conf.QueryHints;
@@ -25,6 +27,7 @@ import org.opengis.feature.simple.SimpleFeature;
 import org.opengis.feature.simple.SimpleFeatureType;
 
 import java.io.*;
+import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.Map;
 import org.locationtech.geomesa.index.conf.QueryHints.RichHints;
@@ -41,6 +44,8 @@ public class JLazyDensityFilter extends FilterBase{
     String sftString;
     SimpleFeatureType sft;
     KryoFeatureSerializer serializer;
+    SimpleFeatureType outputsft = SimpleFeatureTypes.createType("result", "mapkey:String,weight:java.lang.Double");
+    KryoFeatureSerializer output_serializer = new KryoFeatureSerializer(outputsft, SerializationOptions.withoutId());
     RichHints hints;
     private String ENVELOPE_OPT = "envelope";
     private String GRID_WIDTH_OPT  = "grid_width";
@@ -202,14 +207,14 @@ public class JLazyDensityFilter extends FilterBase{
     /**
      * Writes a density record from a feature that has a point geometry
      */
-    void writePoint(SimpleFeature sf, Double weight) {
-        writePointToResult((Point)sf.getAttribute(geomIndex), weight);
+    Map.Entry<String, Double> writePoint(SimpleFeature sf, Double weight) {
+        return writePointToResult((Point)sf.getAttribute(geomIndex), weight);
     }
     /**
      * Writes a density record from a feature that has an arbitrary geometry
      */
-    private void writeNonPoint(Geometry geom, Double weight){
-        writePointToResult(safeCentroid(geom), weight);
+    private Map.Entry<String, Double> writeNonPoint(Geometry geom, Double weight){
+        return writePointToResult(safeCentroid(geom), weight);
     }
 
     private Point safeCentroid(Geometry geom){
@@ -222,15 +227,18 @@ public class JLazyDensityFilter extends FilterBase{
         }
     }
 
-    private void writePointToResult(Point pt, Double weight) {
+    private Map.Entry<String, Double> writePointToResult(Point pt, Double weight) {
         //TODO : SInce i am testing with hints as null, i can not configure gridsnap, so this does not work, so for the time being i dont use gridsnap
         //writeSnappedPoint(gridSnap.i(pt.getX()), gridSnap.j(pt.getY()), weight);
-        writeSnappedPoint((int)pt.getX(), (int)pt.getY(), weight);
+        return writeSnappedPoint((int)pt.getX(), (int)pt.getY(), weight);
     }
 
-    private void writeSnappedPoint(int x, int y, Double weight){
+    private Map.Entry<String, Double> writeSnappedPoint(int x, int y, Double weight){
+        //Tuple2
         String key = x+"$"+ y;
         DensityResult.put(key, DensityResult.getOrDefault(key, 0.0) + weight);
+        return new AbstractMap.SimpleEntry(key, weight);
+
     }
 
     private void writePointToResult(Coordinate pt, Double weight){
@@ -243,26 +251,30 @@ public class JLazyDensityFilter extends FilterBase{
 
     @Override
     public ReturnCode filterKeyValue(Cell v) throws IOException {
+        System.out.println("In filter key value");
         byte[] encodedSF = CellUtil.cloneValue(v);
         SimpleFeature sf = serializer.deserialize(encodedSF);
-
-        System.out.println("In filter");
-        if(isPoints()){
-            writePoint(sf, weightFn(sf));
-        }else{
-            writeNonPoint((Geometry) sf.getDefaultGeometry(), weightFn(sf));
-        }
         return ReturnCode.INCLUDE;
     }
 
     @Override
     public Cell transformCell(Cell v) throws IOException {
+        System.out.println("In transform cell");
+        byte[] row  = CellUtil.cloneRow(v);
         byte[] encodedSF = CellUtil.cloneValue(v);
-        SimpleFeature sf = serializer.deserialize(encodedSF);
-
-        System.out.println("Who: " + sf.getAttribute("Who") + " When: " + sf.getAttribute("When") +  " Where  " + sf.getAttribute("Where"));
-
-        return super.transformCell(v);
+        SimpleFeature sf_old = serializer.deserialize(encodedSF);
+        Map.Entry<String, Double> out;
+        if(isPoints()){
+            out = writePoint(sf_old, weightFn(sf_old));
+        }else{
+            out = writeNonPoint((Geometry) sf_old.getDefaultGeometry(), weightFn(sf_old));
+        }
+        SimpleFeature sf = new ScalaSimpleFeature(sf_old.getID(), outputsft, null, null);
+        sf.setAttribute(0, out.getKey());
+        sf.setAttribute(1, out.getValue());
+        byte[] arr = output_serializer.serialize(sf);
+        Cell cell = CellUtil.createCell(row, arr);
+        return cell;
     }
 
     // TODO: Add static method to compute byte array from SFT and Filter.

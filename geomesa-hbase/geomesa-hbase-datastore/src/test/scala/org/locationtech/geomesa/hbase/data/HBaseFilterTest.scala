@@ -11,19 +11,24 @@ package org.locationtech.geomesa.hbase.data
 import java.nio.charset.StandardCharsets
 
 import com.typesafe.scalalogging.LazyLogging
+import org.apache.hadoop.hbase.client.coprocessor.Batch
+import org.apache.hadoop.hbase.client.coprocessor.Batch.Call
 import org.apache.hadoop.hbase.{HBaseTestingUtility, TableName}
-import org.apache.hadoop.hbase.client.{Connection, Result, Scan}
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.ipc.BlockingRpcCallback
 import org.geotools.data._
 import org.geotools.data.collection.ListFeatureCollection
 import org.geotools.data.simple.SimpleFeatureStore
 import org.geotools.factory.Hints
 import org.geotools.filter.identity.FeatureIdImpl
 import org.geotools.filter.text.ecql.ECQL
+import org.geotools.ows.ServiceException
 import org.junit.runner.RunWith
 import org.locationtech.geomesa.features.ScalaSimpleFeature
 import org.locationtech.geomesa.features.SerializationOption.SerializationOptions
 import org.locationtech.geomesa.features.kryo.KryoFeatureSerializer
 import org.locationtech.geomesa.hbase.data.HBaseDataStoreFactory.Params._
+import org.locationtech.geomesa.hbase.filters.Density.{DensityRequest, DensityResponse, DensityService, Pair => DensityPair}
 import org.locationtech.geomesa.hbase.filters.{JLazyDensityFilter, JSimpleFeatureFilter}
 import org.locationtech.geomesa.hbase.utils.BatchScan
 import org.locationtech.geomesa.index.index.ClientSideFiltering.RowAndValue
@@ -64,6 +69,7 @@ class HBaseFilterTest extends Specification with LazyLogging {
       ds.createSchema(SimpleFeatureTypes.createType(typeName, "name:String:index=true,dtg:Date,*geom:Point:srid=4326"))
 
       val sft = ds.getSchema(typeName)
+
 
       sft must not(beNull)
 
@@ -118,13 +124,42 @@ class HBaseFilterTest extends Specification with LazyLogging {
 
       val scan2 = new BatchScan(connection, table, Seq(scanRange), 2, 100000, Seq(filter))
       val foo = scan2.hasNext
+      val sft1 = SimpleFeatureTypes.createType("result", "mapkey:String,weight:java.lang.Double")
+      val deserializer1 = new KryoFeatureSerializer(sft1, SerializationOptions.withoutId)
+
       val results2 = scan2.map { result =>
         val RowAndValue(row, rowOffset, rowLength, value, valueOffset, valueLength) = rowAndValue(result)
-        val sf: SimpleFeature = deserializer.deserialize(value, valueOffset, valueLength)
+        val sf: SimpleFeature = deserializer1.deserialize(value, valueOffset, valueLength)
         sf
       }
-      results2.foreach { f => println(s"ID: ${f.getID} name: ${f.getAttribute("name")}") }
+      results2.foreach { f => println(s"mapKey: ${f.getAttribute("mapkey")}")}
       println(JLazyDensityFilter.getDensityResult)
+
+      // 3. Run with coprocessot
+      val request : DensityRequest = DensityRequest.newBuilder().setFamily("name:String:index=true,dtg:Date,*geom:Point:srid=4326").setColumn("gross").build()
+      val table1 : HTableInterface = connection.getTable(table).asInstanceOf[HTableInterface]
+
+      try {
+        val DensityResults : Map[Array[Byte],List[DensityPair]] = table1.coprocessorService(classOf[DensityService], null, null, new Call[DensityService, List[DensityPair]] {
+          override def call(aggregate: DensityService): List[DensityPair] = {
+            val rpcCallback = new BlockingRpcCallback[DensityResponse]
+            aggregate.getDensity(null, request, rpcCallback)
+            val response: DensityResponse = rpcCallback.get()
+            println(response)
+            if(response.getPairsList != null){
+              return response.getPairsList.asScala.toList
+            }else{
+              return List[DensityPair]()
+            }
+          }
+        }).asScala.toMap;
+
+        for (pairs <- DensityResults.values)
+          pairs.foreach{ densityPair: DensityPair => println(densityPair.toString)}
+
+      } catch {
+        case e: Exception => e.printStackTrace()
+      }
 
       true mustEqual(true)
     }

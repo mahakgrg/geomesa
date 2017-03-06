@@ -1,0 +1,24 @@
+option java_package = "org.locationtech.geomesa.hbase.filters";
+option java_outer_classname = "Density";
+option java_generic_services = true;
+option java_generate_equals_and_hash = true;
+option optimize_for = SPEED;
+
+message DensityRequest {
+    required string family = 1;
+    required string column = 2;
+}
+
+message DensityResponse {
+    repeated Pair pairs = 1;
+}
+
+message Pair {
+    optional string key = 1;
+    optional double value = 2;
+}
+
+service DensityService {
+  rpc getDensity(DensityRequest)
+    returns (DensityResponse);
+}
